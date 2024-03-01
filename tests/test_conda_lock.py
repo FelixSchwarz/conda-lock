@@ -5,20 +5,21 @@ import logging
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import typing
 import uuid
+import warnings
 
 from glob import glob
 from pathlib import Path
-from typing import Any, ContextManager, Dict, List, Tuple, Union
+from typing import Any, ContextManager, Dict, List, Literal, Set, Tuple, Union
 from unittest.mock import MagicMock
 from urllib.parse import urldefrag, urlsplit
 
-import filelock
 import pytest
 import yaml
 
@@ -39,9 +40,12 @@ from conda_lock.conda_lock import (
     create_lockfile_from_spec,
     default_virtual_package_repodata,
     determine_conda_executable,
+    do_render,
     extract_input_hash,
+    install,
     main,
     make_lock_spec,
+    render_lockfile_for_platform,
     run_lock,
 )
 from conda_lock.conda_solver import extract_json_object, fake_conda_environment
@@ -51,6 +55,9 @@ from conda_lock.errors import (
     PlatformValidationError,
 )
 from conda_lock.interfaces.vendored_conda import MatchSpec
+from conda_lock.interfaces.vendored_poetry import (
+    CalledProcessError as PoetryCalledProcessError,
+)
 from conda_lock.invoke_conda import is_micromamba, reset_conda_pkgs_dir
 from conda_lock.lockfile import parse_conda_lock_file
 from conda_lock.lockfile.v2prelim.models import (
@@ -58,10 +65,17 @@ from conda_lock.lockfile.v2prelim.models import (
     LockedDependency,
     MetadataOption,
 )
+from conda_lock.lookup import _LookupLoader
 from conda_lock.models.channel import Channel
 from conda_lock.models.lock_spec import Dependency, VCSDependency, VersionedDependency
 from conda_lock.models.pip_repository import PipRepository
-from conda_lock.pypi_solver import _strip_auth, parse_pip_requirement, solve_pypi
+from conda_lock.pypi_solver import (
+    MANYLINUX_TAGS,
+    PlatformEnv,
+    _strip_auth,
+    parse_pip_requirement,
+    solve_pypi,
+)
 from conda_lock.src_parser import (
     DEFAULT_PLATFORMS,
     LockSpecification,
@@ -88,7 +102,7 @@ if typing.TYPE_CHECKING:
     from tests.conftest import QuetzServerInfo
 
 
-TEST_DIR = Path(__file__).parent
+TESTS_DIR = Path(__file__).parent
 
 
 @pytest.fixture(autouse=True)
@@ -104,22 +118,11 @@ def reset_global_conda_pkgs_dir():
 def clone_test_dir(name: Union[str, List[str]], tmp_path: Path) -> Path:
     if isinstance(name, str):
         name = [name]
-    test_dir = TEST_DIR.joinpath(*name)
+    test_dir = TESTS_DIR.joinpath(*name)
     assert test_dir.exists()
     assert test_dir.is_dir()
-    if sys.version_info >= (3, 8):
-        shutil.copytree(test_dir, tmp_path, dirs_exist_ok=True)
-    else:
-        from distutils.dir_util import copy_tree
-
-        copy_tree(str(test_dir), str(tmp_path))
+    shutil.copytree(test_dir, tmp_path, dirs_exist_ok=True)
     return tmp_path
-
-
-@contextlib.contextmanager
-def install_lock():
-    with filelock.FileLock(str(TEST_DIR.joinpath("install.lock"))):
-        yield
 
 
 @pytest.fixture
@@ -161,6 +164,20 @@ def pip_local_package_environment(tmp_path: Path):
 @pytest.fixture
 def zlib_environment(tmp_path: Path):
     return clone_test_dir("zlib", tmp_path).joinpath("environment.yml")
+
+
+@pytest.fixture
+def tzcode_environment(tmp_path: Path):
+    contents = """
+    channels:
+        - conda-forge
+        - nodefaults
+    dependencies:
+        - tzcode
+    """
+    env = tmp_path / "environment.yml"
+    env.write_text(contents)
+    return env
 
 
 @pytest.fixture
@@ -296,6 +313,13 @@ def pip_conda_name_confusion(tmp_path: Path):
     """Path to an environment.yaml that has a hardcoded channel in one of the dependencies"""
     return clone_test_dir("test-pip-conda-name-confusion", tmp_path).joinpath(
         "environment.yaml"
+    )
+
+
+@pytest.fixture
+def lightgbm_environment(tmp_path: Path):
+    return clone_test_dir("test-pip-finds-recent-manylinux-wheels", tmp_path).joinpath(
+        "environment.yml"
     )
 
 
@@ -734,9 +758,7 @@ def test_parse_poetry_skip_non_conda_lock(
 def test_parse_poetry_git(poetry_pyproject_toml_git: Path):
     res = parse_pyproject_toml(poetry_pyproject_toml_git, ["linux-64"])
 
-    specs = {
-        dep.name: typing.cast(Dependency, dep) for dep in res.dependencies["linux-64"]
-    }
+    specs = {dep.name: dep for dep in res.dependencies["linux-64"]}
 
     assert isinstance(specs["pydantic"], VCSDependency)
     assert specs["pydantic"].vcs == "git"
@@ -980,6 +1002,64 @@ def test_parse_poetry_invalid_optionals(pyproject_optional_toml: Path):
     )
 
 
+def test_explicit_toposorted() -> None:
+    """Verify that explicit lockfiles are topologically sorted.
+
+    We write unified lockfiles in alphabetical order. This is okay because we store
+    the dependency information in the lockfile, so we have the necessary information
+    to perform topological sorting. However, explicit lockfiles do not store dependency
+    information, and thus need to be written in topological order.
+
+    Verifying topological ordering is very easy: we just need to make sure that each
+    package is written after all of its dependencies.
+    """
+    lockfile = parse_conda_lock_file(
+        TESTS_DIR / "test-explicit-toposorted" / "conda-lock.yml"
+    )
+
+    # These are the individual lines as they appear in an explicit lockfile file
+    lines = render_lockfile_for_platform(
+        lockfile=lockfile,
+        kind="explicit",
+        platform="linux-64",
+        include_dev_dependencies=False,
+        extras=set(),
+    )
+
+    # Packages are listed by URL, but we want to check by name.
+    url_to_name = {package.url: package.name for package in lockfile.package}
+    # For each package name we need the names of its dependencies
+    name_to_deps = {
+        package.name: set(package.dependencies.keys()) for package in lockfile.package
+    }
+
+    # We do a simulated installation run, and keep track of the packages
+    # that have been installed so far in installed_names
+    installed_names: Set[str] = set()
+
+    # Simulate installing each package in the order it appears in the lockfile.
+    # Verify that each package is installed after all of its dependencies.
+    for n, line in enumerate(lines):
+        if not line or line.startswith("#") or line.startswith("@EXPLICIT"):
+            continue
+        # Line should have the format url#hash
+        url = line.split("#")[0]
+        name = url_to_name[url]
+        deps = name_to_deps[name]
+
+        # Verify that all dependencies have been simulated-installed
+        for dep in deps:
+            if dep.startswith("__"):
+                # This is a virtual package, so we don't need to check it
+                continue
+            assert (
+                dep in installed_names
+            ), f"{n=}, {line=}, {name=}, {dep=}, {installed_names=}"
+
+        # Simulate installing the package
+        installed_names.add(name)
+
+
 def test_run_lock(
     monkeypatch: "pytest.MonkeyPatch", zlib_environment: Path, conda_exe: str
 ):
@@ -1031,7 +1111,7 @@ def test_run_lock_with_input_metadata(
 def test_run_lock_with_time_metadata(
     monkeypatch: "pytest.MonkeyPatch", zlib_environment: Path, conda_exe: str
 ):
-    TIME_DIR = TEST_DIR / "test-time-metadata"
+    TIME_DIR = TESTS_DIR / "test-time-metadata"
 
     TIME_DIR.mkdir(exist_ok=True)
     monkeypatch.chdir(TIME_DIR)
@@ -1073,11 +1153,12 @@ def test_run_lock_with_git_metadata(
         monkeypatch.setenv("CONDA_FLAGS", "-v")
 
     import git
+    import git.exc
 
     try:
-        repo = git.Repo(search_parent_directories=True)  # type: ignore
-    except git.exc.InvalidGitRepositoryError:  # type: ignore
-        repo = git.Repo.init()  # type: ignore
+        repo = git.Repo(search_parent_directories=True)
+    except git.exc.InvalidGitRepositoryError:
+        repo = git.Repo.init()
         repo.index.add([git_metadata_zlib_environment])
         repo.index.commit(
             "temporary commit for running via github actions without failure"
@@ -1341,11 +1422,7 @@ def test_run_lock_with_locked_environment_files(
     make_lock_files = MagicMock()
     monkeypatch.setattr("conda_lock.conda_lock.make_lock_files", make_lock_files)
     run_lock(DEFAULT_FILES, conda_exe=conda_exe, update=["pydantic"])
-    if sys.version_info < (3, 8):
-        # backwards compat
-        src_files = make_lock_files.call_args_list[0][1]["src_files"]
-    else:
-        src_files = make_lock_files.call_args.kwargs["src_files"]
+    src_files = make_lock_files.call_args.kwargs["src_files"]
 
     assert [p.resolve() for p in src_files] == [
         Path(update_environment.parent / "environment-preupdate.yml")
@@ -1374,11 +1451,7 @@ def test_run_lock_relative_source_path(
     run_lock(
         DEFAULT_FILES, lockfile_path=lockfile, conda_exe=conda_exe, update=["pydantic"]
     )
-    if sys.version_info < (3, 8):
-        # backwards compat
-        src_files = make_lock_files.call_args_list[0][1]["src_files"]
-    else:
-        src_files = make_lock_files.call_args.kwargs["src_files"]
+    src_files = make_lock_files.call_args.kwargs["src_files"]
     assert [p.resolve() for p in src_files] == [environment.resolve()]
 
 
@@ -1567,7 +1640,7 @@ def test_run_with_channel_inversion(
     lockfile = parse_conda_lock_file(channel_inversion.parent / DEFAULT_LOCKFILE_NAME)
     for package in lockfile.package:
         if package.name == "cuda-python":
-            ms = MatchSpec(package.url)  # type: ignore
+            ms = MatchSpec(package.url)  # pyright: ignore
             assert ms.get("channel") == "conda-forge"
             break
     else:
@@ -1725,21 +1798,23 @@ def conda_supports_env(conda_exe: str):
         subprocess.check_call(
             [conda_exe, "env"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, PoetryCalledProcessError):
         return False
     return True
 
 
-@pytest.mark.parametrize("kind", ["explicit", "env"])
-@flaky
+@pytest.mark.parametrize("kind", ["explicit", "env", "lock"])
 def test_install(
     request: "pytest.FixtureRequest",
     kind: str,
     tmp_path: Path,
     conda_exe: str,
-    zlib_environment: Path,
+    # We choose tzcode since it depends on glibc on linux-64, and this induces a
+    # virtual package, and we test to make sure it's filtered out from the lockfile.
+    tzcode_environment: Path,
     monkeypatch: "pytest.MonkeyPatch",
     capsys: "pytest.CaptureFixture[str]",
+    install_lock,
 ):
     if is_micromamba(conda_exe):
         monkeypatch.setenv("CONDA_FLAGS", "-v")
@@ -1755,58 +1830,54 @@ def test_install(
     generated_lockfile_path.mkdir(exist_ok=True)
     monkeypatch.chdir(generated_lockfile_path)
 
-    package = "zlib"
+    package = "tzcode"
     platform = "linux-64"
 
     lock_filename_template = (
         request.node.name + "conda-{platform}-{dev-dependencies}.lock"
     )
-    lock_filename = (
-        request.node.name
-        + "conda-linux-64-true.lock"
-        + (".yml" if kind == "env" else "")
-    )
+    if kind == "env":
+        lock_filename = request.node.name + "conda-linux-64-true.lock.yml"
+    elif kind == "explicit":
+        lock_filename = request.node.name + "conda-linux-64-true.lock"
+    elif kind == "lock":
+        lock_filename = "conda-lock.yml"
+    else:
+        raise ValueError(f"Unknown kind: {kind}")
+
+    lock_args = [
+        "lock",
+        "--conda",
+        conda_exe,
+        "-p",
+        platform,
+        "-f",
+        str(tzcode_environment),
+        "-k",
+        kind,
+        "--filename-template",
+        lock_filename_template,
+    ]
 
     with capsys.disabled():
         runner = CliRunner(mix_stderr=False)
-        result = runner.invoke(
-            main,
-            [
-                "lock",
-                "--conda",
-                conda_exe,
-                "-p",
-                platform,
-                "-f",
-                str(zlib_environment),
-                "-k",
-                kind,
-                "--filename-template",
-                lock_filename_template,
-            ],
-            catch_exceptions=False,
-        )
+        result = runner.invoke(main, lock_args, catch_exceptions=False)
     print(result.stdout, file=sys.stdout)
     print(result.stderr, file=sys.stderr)
     assert result.exit_code == 0
 
-    prefix = root_prefix / "test_env"
+    lockfile_content = Path(lock_filename).read_text()
+    if kind == "lock":
+        might_contain_virtual_package = "name: __" in lockfile_content
+    else:
+        might_contain_virtual_package = "__" in lockfile_content
+    assert not might_contain_virtual_package, (
+        f"Lockfile may contain a virtual package (e.g. __glibc). "
+        f"These should never appear in the lockfile. "
+        f"{lockfile_content}"
+    )
 
-    def invoke_install(*extra_args: str) -> CliResult:
-        with capsys.disabled():
-            return runner.invoke(
-                main,
-                [
-                    "install",
-                    "--conda",
-                    conda_exe,
-                    "--prefix",
-                    str(prefix),
-                    *extra_args,
-                    lock_filename,
-                ],
-                catch_exceptions=False,
-            )
+    prefix = root_prefix / "test_env"
 
     context: ContextManager
     if sys.platform.lower().startswith("linux"):
@@ -1815,8 +1886,17 @@ def test_install(
         # since by default we do platform validation we would expect this to fail
         context = pytest.raises(PlatformValidationError)
 
-    with context, install_lock():
-        result = invoke_install()
+    install_args = [
+        "install",
+        "--conda",
+        conda_exe,
+        "--prefix",
+        str(prefix),
+        lock_filename,
+    ]
+    with context:
+        with capsys.disabled():
+            result = runner.invoke(main, install_args, catch_exceptions=False)
     print(result.stdout, file=sys.stdout)
     print(result.stderr, file=sys.stderr)
     if Path(lock_filename).exists():
@@ -1830,6 +1910,68 @@ def test_install(
             package=package,
             prefix=str(prefix),
         ), f"Package {package} does not exist in {prefix} environment"
+
+
+@pytest.fixture
+def install_with_pip_deps_lockfile(tmp_path: Path):
+    return clone_test_dir("test-install-with-pip-deps", tmp_path).joinpath(
+        "conda-lock.yml"
+    )
+
+
+PIP_WITH_EXPLICIT_LOCKFILE_WARNING = """installation of pip dependencies from exp"""
+
+
+def test_install_with_pip_deps(
+    tmp_path: Path,
+    conda_exe: str,
+    install_with_pip_deps_lockfile: Path,
+    monkeypatch: "pytest.MonkeyPatch",
+    caplog,
+    install_lock,
+):
+    root_prefix = tmp_path / "root_prefix"
+
+    root_prefix.mkdir(exist_ok=True)
+
+    package = "requests"
+    prefix = root_prefix / "test_env"
+
+    context: ContextManager
+    if sys.platform.lower().startswith("linux"):
+        context = contextlib.nullcontext()
+    else:
+        # since by default we do platform validation we would expect this to fail
+        context = pytest.raises(PlatformValidationError)
+
+    with context:
+        install(
+            conda=str(conda_exe),
+            prefix=str(prefix),
+            lock_file=install_with_pip_deps_lockfile,
+        )
+        assert PIP_WITH_EXPLICIT_LOCKFILE_WARNING not in caplog.text
+
+        conda_metas = list(glob(f"{prefix}/conda-meta/{package}-*.json"))
+        assert len(conda_metas) == 0, "pip package should not be installed by conda"
+
+    if sys.platform.lower().startswith("linux"):
+        python = prefix / "bin" / "python"
+        subprocess.check_call([str(python), "-c", "import requests"])
+
+
+@pytest.mark.parametrize("kind", ["explicit", "env"])
+def test_warn_on_explicit_lock_with_pip_deps(
+    kind: Literal["explicit", "env"],
+    install_with_pip_deps_lockfile: Path,
+    caplog,
+):
+    lock_content = parse_conda_lock_file(install_with_pip_deps_lockfile)
+    do_render(lock_content, kinds=[kind])
+    if kind == "explicit":
+        assert PIP_WITH_EXPLICIT_LOCKFILE_WARNING in caplog.text
+    else:
+        assert PIP_WITH_EXPLICIT_LOCKFILE_WARNING not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1914,7 +2056,7 @@ def test__extract_domain(line: str, stripped: str):
 
 
 def _read_file(filepath: "str | Path") -> str:
-    with open(filepath, mode="r") as file_pointer:
+    with open(filepath) as file_pointer:
         return file_pointer.read()
 
 
@@ -2001,8 +2143,8 @@ def auth_():
     "stripped_lockfile,lockfile_with_auth",
     tuple(
         (
-            _read_file(TEST_DIR / "test-stripped-lockfile" / f"{filename}.lock"),
-            _read_file(TEST_DIR / "test-lockfile-with-auth" / f"{filename}.lock"),
+            _read_file(TESTS_DIR / "test-stripped-lockfile" / f"{filename}.lock"),
+            _read_file(TESTS_DIR / "test-lockfile-with-auth" / f"{filename}.lock"),
         )
         for filename in ("test",)
     ),
@@ -2020,7 +2162,7 @@ def test_virtual_packages(
     kind: str,
     capsys: "pytest.CaptureFixture[str]",
 ):
-    test_dir = TEST_DIR.joinpath("test-cuda")
+    test_dir = TESTS_DIR.joinpath("test-cuda")
     monkeypatch.chdir(test_dir)
 
     if is_micromamba(conda_exe):
@@ -2086,7 +2228,7 @@ def test_virtual_packages(
 def test_virtual_package_input_hash_stability():
     from conda_lock.virtual_package import virtual_package_repo_from_specification
 
-    test_dir = TEST_DIR.joinpath("test-cuda")
+    test_dir = TESTS_DIR.joinpath("test-cuda")
     vspec = test_dir / "virtual-packages-old-glibc.yaml"
 
     vpr = virtual_package_repo_from_specification(vspec)
@@ -2106,9 +2248,9 @@ def test_default_virtual_package_input_hash_stability():
     vpr = default_virtual_package_repodata()
 
     expected = {
-        "linux-64": "dbd71bccc4b3be81038e44b1f14891ccec40a6d70a43cfe02295fc77a2ea9eb5",
-        "linux-aarch64": "023611fb84c00fb5aaeddde1e0ac62e6ae007aecf6f69ccb5dbfc3cd6d945436",
-        "linux-ppc64le": "8533a7bd0e950f7b085eeef7686d2c4895e84b8ffdbfba6d62863072ac41090c",
+        "linux-64": "a949aac83da089258ce729fcd54dc0a3a1724ea325d67680d7a6d7cc9c0f1d1b",
+        "linux-aarch64": "f68603a3a28dbb03d20a25e1dacda3c42b6acc8a93bd31e13c4956115820cfa6",
+        "linux-ppc64le": "ababb6bc556ac8c9e27a499bf9b83b5757f6ded385caa0c3d7bf3f360dfe358d",
         "osx-64": "b7eebe4be0654740f67e3023f2ede298f390119ef225f50ad7e7288ea22d5c93",
         "osx-arm64": "cc82018d1b1809b9aebacacc5ed05ee6a4318b3eba039607d2a6957571f8bf2b",
         "win-64": "44239e9f0175404e62e4a80bb8f4be72e38c536280d6d5e484e52fa04b45c9f6",
@@ -2198,6 +2340,7 @@ def test_private_lock(
     capsys: "pytest.CaptureFixture[str]",
     conda_exe: str,
     placeholder,
+    install_lock,
 ):
     if is_micromamba(conda_exe):
         res = subprocess.run(
@@ -2240,19 +2383,18 @@ def test_private_lock(
             env_name = uuid.uuid4().hex
             env_prefix = tmp_path / env_name
 
-            with install_lock():
-                result: Result = runner.invoke(
-                    main,
-                    [
-                        "install",
-                        "--conda",
-                        conda_exe,
-                        "--prefix",
-                        str(env_prefix),
-                        str(tmp_path / "conda-lock.yml"),
-                    ],
-                    catch_exceptions=False,
-                )
+            result: Result = runner.invoke(
+                main,
+                [
+                    "install",
+                    "--conda",
+                    conda_exe,
+                    "--prefix",
+                    str(env_prefix),
+                    str(tmp_path / "conda-lock.yml"),
+                ],
+                catch_exceptions=False,
+            )
 
         print(result.stdout, file=sys.stdout)
         print(result.stderr, file=sys.stderr)
@@ -2263,6 +2405,90 @@ def test_private_lock(
     monkeypatch.delenv("QUETZ_API_KEY")
     with pytest.raises(MissingEnvVarError):
         run_install()
+
+
+def test_lookup_sources():
+    # Test that the lookup can be read from a file:// URL
+    lookup = (
+        Path(__file__).parent / "test-lookup" / "emoji-to-python-dateutil-lookup.yml"
+    )
+    url = f"file://{lookup.absolute()}"
+    LOOKUP_OBJECT = _LookupLoader()
+    LOOKUP_OBJECT.mapping_url = url
+    assert LOOKUP_OBJECT.conda_lookup["emoji"]["pypi_name"] == "python-dateutil"
+
+    # Test that the lookup can be read from a straight filename
+    url = str(lookup.absolute())
+    LOOKUP_OBJECT = _LookupLoader()
+    LOOKUP_OBJECT.mapping_url = url
+    assert LOOKUP_OBJECT.conda_lookup["emoji"]["pypi_name"] == "python-dateutil"
+
+    # Test that the default remote lookup contains expected nontrivial mappings
+    LOOKUP_OBJECT = _LookupLoader()
+    assert LOOKUP_OBJECT.conda_lookup["python-build"]["pypi_name"] == "build"
+
+
+@pytest.fixture
+def lookup_environment(tmp_path: Path):
+    return clone_test_dir("test-lookup", tmp_path).joinpath("environment.yml")
+
+
+@pytest.mark.parametrize(
+    "lookup_source", ["emoji-to-python-dateutil-lookup.yml", "empty-lookup.yml"]
+)
+def test_lookup(
+    lookup_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    lookup_source: str,
+):
+    """We test that the lookup table is being used to convert conda package names into
+    pypi package names. We verify this by comparing the results from using two
+    different lookup tables.
+
+    The pip solver runs after the conda solver. The pip solver needs to know which
+    packages are already installed by conda. The lookup table is used to convert conda
+    package names into pypi package names.
+
+    We test two cases:
+    1. The lookup table is empty. In this case, the conda package names are converted
+    directly into pypi package names. As long as there are no discrepancies between
+    conda and pypi package names, this gives expected results.
+    2. The lookup table maps emoji to python-dateutil. Arrow is installed as a pip
+    package and has python-dateutil as a dependency. Due to this lookup table, the
+    pip solver should believe that the dependency is already satisfied and not add it.
+    """
+    cwd = lookup_environment.parent
+    monkeypatch.chdir(cwd)
+    lookup_filename = str((cwd / lookup_source).absolute())
+    with capsys.disabled():
+        from click.testing import CliRunner, Result
+
+        runner = CliRunner(mix_stderr=False)
+        result: Result = runner.invoke(
+            main,
+            ["lock", "--pypi_to_conda_lookup_file", lookup_filename],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+    lockfile = cwd / DEFAULT_LOCKFILE_NAME
+    assert lockfile.is_file()
+    lockfile_content = parse_conda_lock_file(lockfile)
+    installed_packages = {p.name for p in lockfile_content.package}
+    assert "emoji" in installed_packages
+    assert "arrow" in installed_packages
+    assert "types-python-dateutil" in installed_packages
+    if lookup_source == "empty-lookup.yml":
+        # If the lookup table is empty, then conda package names are converted
+        # directly into pypi package names. Arrow depends on python-dateutil, so
+        # it should be installed.
+        assert "python-dateutil" in installed_packages
+    else:
+        # The nonempty lookup table maps emoji to python-dateutil. Thus the pip
+        # solver should believe that the dependency is already satisfied and not
+        # add it as a pip dependency.
+        assert "python-dateutil" not in installed_packages
 
 
 def test_extract_json_object():
@@ -2293,3 +2519,213 @@ def test_cli_version(capsys: "pytest.CaptureFixture[str]"):
     # the part before, in this case just "0.11.3".
     version_without_dev = __version__.split(".dev")[0]
     assert version_without_dev in result.stdout
+
+
+def test_pip_finds_recent_manylinux_wheels(
+    monkeypatch: "pytest.MonkeyPatch", lightgbm_environment: Path, conda_exe: str
+):
+    """Ensure that we find a manylinux wheel with glibc > 2.17 for lightgbm.
+
+    See https://github.com/conda/conda-lock/issues/517 for more context.
+
+    If not found, installation would trigger a build of lightgbm from source.
+    If this test fails, it likely means that MANYLINUX_TAGS in
+    `conda_lock/pypi_solver.py` is out of date.
+    """
+    monkeypatch.chdir(lightgbm_environment.parent)
+    run_lock([lightgbm_environment], conda_exe=conda_exe, platforms=["linux-64"])
+    lockfile = parse_conda_lock_file(
+        lightgbm_environment.parent / DEFAULT_LOCKFILE_NAME
+    )
+
+    (lightgbm_dep,) = (p for p in lockfile.package if p.name == "lightgbm")
+    manylinux_pattern = r"manylinux_(\d+)_(\d+).+\.whl"
+    manylinux_match = re.search(manylinux_pattern, lightgbm_dep.url)
+    assert manylinux_match, "No match found for manylinux version in {lightgbm_dep.url}"
+
+    manylinux_version = [int(each) for each in manylinux_match.groups()]
+    # Make sure the manylinux wheel was built with glibc > 2.17 as a
+    # non-regression test for #517
+    assert manylinux_version > [2, 17]
+
+
+def test_manylinux_tags():
+    from packaging.version import Version
+
+    MANYLINUX_TAGS = pypi_solver.MANYLINUX_TAGS
+
+    # The irregular tags should come at the beginning:
+    assert MANYLINUX_TAGS[:4] == ["1", "2010", "2014", "_2_17"]
+    # All other tags should start with "_"
+    assert all(tag.startswith("_") for tag in MANYLINUX_TAGS[3:])
+
+    # Now check that the remaining tags parse to versions in increasing order
+    versions = [Version(tag[1:].replace("_", ".")) for tag in MANYLINUX_TAGS[3:]]
+    assert versions[0] == Version("2.17")
+    assert versions == sorted(versions)
+
+    # Verify that the default repodata uses the highest glibc version
+    default_repodata = default_virtual_package_repodata()
+    glibc_versions_in_default_repodata: Set[Version] = {
+        Version(package.version)
+        for package in default_repodata.packages_by_subdir
+        if package.name == "__glibc"
+    }
+    max_glibc_version_from_manylinux_tags = versions[-1]
+    assert glibc_versions_in_default_repodata == {max_glibc_version_from_manylinux_tags}
+
+
+def test_pip_respects_glibc_version(
+    tmp_path: Path, conda_exe: str, monkeypatch: "pytest.MonkeyPatch"
+):
+    """Ensure that we find a manylinux wheel that respects an older glibc constraint.
+
+    This is somewhat the opposite of test_pip_finds_recent_manylinux_wheels
+    """
+
+    env_file = clone_test_dir("test-pip-respects-glibc-version", tmp_path).joinpath(
+        "environment.yml"
+    )
+    monkeypatch.chdir(env_file.parent)
+    run_lock(
+        [env_file],
+        conda_exe=str(conda_exe),
+        platforms=["linux-64"],
+        virtual_package_spec=env_file.parent / "virtual-packages.yml",
+    )
+
+    lockfile = parse_conda_lock_file(env_file.parent / DEFAULT_LOCKFILE_NAME)
+
+    (cryptography_dep,) = (p for p in lockfile.package if p.name == "cryptography")
+    manylinux_pattern = r"manylinux_(\d+)_(\d+).+\.whl"
+    # Should return the first match so higher version first.
+    manylinux_match = re.search(manylinux_pattern, cryptography_dep.url)
+    assert (
+        manylinux_match
+    ), "No match found for manylinux version in {cryptography_dep.url}"
+
+    manylinux_version = [int(each) for each in manylinux_match.groups()]
+    # Make sure the manylinux wheel was built with glibc <= 2.17
+    # since that is what the virtual package spec requires
+    assert manylinux_version == [2, 17]
+
+
+def test_platformenv_linux_platforms():
+    """Check that PlatformEnv correctly handles Linux platforms for wheels"""
+    # This is the default and maximal list of platforms that we expect
+    all_expected_platforms = [
+        f"manylinux{glibc_ver}_x86_64" for glibc_ver in reversed(MANYLINUX_TAGS)
+    ] + ["linux_x86_64"]
+
+    # Check that we get the default platforms when no virtual packages are specified
+    e = PlatformEnv("3.12", "linux-64")
+    assert e._platforms == all_expected_platforms
+
+    # Check that we get the default platforms when the virtual packages are empty
+    e = PlatformEnv("3.12", "linux-64", platform_virtual_packages={})
+    assert e._platforms == all_expected_platforms
+
+    # Check that we get the default platforms when the virtual packages are nonempty
+    # but don't include __glibc
+    platform_virtual_packages = {"x.bz2": {"name": "not_glibc"}}
+    e = PlatformEnv(
+        "3.12", "linux-64", platform_virtual_packages=platform_virtual_packages
+    )
+    assert e._platforms == all_expected_platforms
+
+    # Check that we get the expected platforms when using the default repodata.
+    # (This should include the glibc corresponding to the latest manylinux tag.)
+    default_repodata = default_virtual_package_repodata()
+    platform_virtual_packages = default_repodata.all_repodata["linux-64"]["packages"]
+    e = PlatformEnv(
+        "3.12", "linux-64", platform_virtual_packages=platform_virtual_packages
+    )
+    assert e._platforms == all_expected_platforms
+
+    # Check that we get the expected platforms after removing glibc from the
+    # default repodata.
+    platform_virtual_packages = {
+        filename: record
+        for filename, record in platform_virtual_packages.items()
+        if record["name"] != "__glibc"
+    }
+    e = PlatformEnv(
+        "3.12", "linux-64", platform_virtual_packages=platform_virtual_packages
+    )
+    assert e._platforms == all_expected_platforms
+
+    # Check that we get a restricted list of platforms when specifying a
+    # lower glibc version.
+    restricted_platforms = [
+        "manylinux_2_17_x86_64",
+        "manylinux2014_x86_64",
+        "manylinux2010_x86_64",
+        "manylinux1_x86_64",
+        "linux_x86_64",
+    ]
+    platform_virtual_packages["__glibc-2.17-0.tar.bz2"] = dict(
+        name="__glibc", version="2.17"
+    )
+    e = PlatformEnv(
+        "3.12", "linux-64", platform_virtual_packages=platform_virtual_packages
+    )
+    assert e._platforms == restricted_platforms
+
+    # Check that a warning is raised when there are multiple glibc versions
+    platform_virtual_packages["__glibc-2.28-0.tar.bz2"] = dict(
+        name="__glibc", version="2.28"
+    )
+    with pytest.warns(UserWarning):
+        e = PlatformEnv(
+            "3.12", "linux-64", platform_virtual_packages=platform_virtual_packages
+        )
+    assert e._platforms == restricted_platforms
+
+
+def test_parse_environment_file_with_pip_and_platform_selector():
+    """See https://github.com/conda/conda-lock/pull/564 for the context."""
+    env_file = TESTS_DIR / "test-pip-with-platform-selector" / "environment.yml"
+    spec = parse_environment_file(env_file, platforms=["linux-64", "osx-arm64"])
+    assert spec.platforms == ["linux-64", "osx-arm64"]
+    assert spec.dependencies["osx-arm64"] == [
+        VersionedDependency(name="tomli", manager="conda", version="")
+    ]
+    assert spec.dependencies["linux-64"] == [
+        VersionedDependency(name="tomli", manager="conda", version=""),
+        VersionedDependency(name="psutil", manager="pip", version="*"),
+        VersionedDependency(name="pip", manager="conda", version="*"),
+    ]
+
+
+def test_pip_full_whl_url(
+    tmp_path: Path, conda_exe: str, monkeypatch: "pytest.MonkeyPatch"
+):
+    """Ensure that we can specify full wheel URL in the environment file."""
+
+    env_file = clone_test_dir("test-pip-full-url", tmp_path).joinpath("environment.yml")
+    monkeypatch.chdir(env_file.parent)
+    run_lock(
+        [env_file],
+        conda_exe=str(conda_exe),
+        platforms=["linux-64"],
+    )
+
+    lockfile = parse_conda_lock_file(env_file.parent / DEFAULT_LOCKFILE_NAME)
+
+    (requests_dep,) = (p for p in lockfile.package if p.name == "requests")
+    (typing_extensions_dep,) = (
+        p for p in lockfile.package if p.name == "typing-extensions"
+    )
+    assert (
+        requests_dep.url
+        == "https://github.com/psf/requests/releases/download/v2.31.0/requests-2.31.0-py3-none-any.whl"
+    )
+    assert requests_dep.hash.sha256 is None
+    assert (
+        typing_extensions_dep.url
+        == "https://files.pythonhosted.org/packages/24/21/7d397a4b7934ff4028987914ac1044d3b7d52712f30e2ac7a2ae5bc86dd0/typing_extensions-4.8.0-py3-none-any.whl"
+    )
+    assert (
+        typing_extensions_dep.hash.sha256
+        == "8f92fc8806f9a6b641eaa5318da32b44d401efaac0f6678c9bc448ba3605faa0"
+    )

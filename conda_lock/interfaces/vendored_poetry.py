@@ -14,6 +14,7 @@ from conda_lock._vendor.poetry.repositories.legacy_repository import LegacyRepos
 from conda_lock._vendor.poetry.repositories.pool import Pool
 from conda_lock._vendor.poetry.repositories.pypi_repository import PyPiRepository
 from conda_lock._vendor.poetry.repositories.repository import Repository
+from conda_lock._vendor.poetry.utils._compat import CalledProcessError
 from conda_lock._vendor.poetry.utils.env import Env
 from conda_lock._vendor.poetry.utils.helpers import get_cert, get_client_cert
 
@@ -21,6 +22,7 @@ from conda_lock._vendor.poetry.utils.helpers import get_cert, get_client_cert
 __all__ = [
     "get_cert",
     "get_client_cert",
+    "CalledProcessError",
     "Chooser",
     "Config",
     "Env",

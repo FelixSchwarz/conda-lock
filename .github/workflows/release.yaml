@@ -11,12 +11,12 @@ jobs:
   packages:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac # v4
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
       with:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: 3.9
 
@@ -37,7 +37,7 @@ jobs:
 
     - name: Publish a Python distribution to PyPI
       if: ${{ github.event_name == 'release' }}
-      uses: pypa/gh-action-pypi-publish@v1.8.10
+      uses: pypa/gh-action-pypi-publish@v1.8.11
       with:
         user: __token__
         password: ${{ secrets.PYPI_PASSWORD }}
